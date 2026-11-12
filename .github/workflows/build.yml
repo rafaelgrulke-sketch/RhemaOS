@@ -1,0 +1,125 @@
+name: Build RhemaOS ISO
+
+on:
+  workflow_dispatch: # Permite que você clique em um botão para gerar a ISO quando quiser
+
+jobs:
+  build-iso:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Instalar dependências de compilação
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap squashfs-tools xorriso grub-pc-bin \
+            grub-efi-amd64-bin mtools live-build libwayland-dev
+
+      - name: Criar script de Build
+        run: |
+          cat << 'EOF' > build.sh
+          #!/usr/bin/env bash
+          set -e
+          WORK_DIR="/opt/rhemaos-build"
+          ROOTFS="$WORK_DIR/rootfs"
+          ISO_DIR="$WORK_DIR/iso"
+          ISO_NAME="RhemaOS-1.0-Beta-amd64.iso"
+
+          sudo mkdir -p "$ROOTFS" "$ISO_DIR/live" "$ISO_DIR/boot/grub"
+
+          echo "=== 1. Debootstrap ==="
+          sudo debootstrap --variant=minbase --arch=amd64 bookworm "$ROOTFS" http://deb.debian.org/debian/
+
+          echo "=== 2. Montar sistemas virtuais ==="
+          sudo mount --bind /dev "$ROOTFS/dev"
+          sudo mount --bind /dev/pts "$ROOTFS/dev/pts"
+          sudo mount -t proc /proc "$ROOTFS/proc"
+          sudo mount -t sysfs /sys "$ROOTFS/sys"
+
+          echo "=== 3. Chroot Setup ==="
+          cat << 'INNER_EOF' | sudo tee "$ROOTFS/tmp/setup.sh" > /dev/null
+          #!/bin/bash
+          export DEBIAN_FRONTEND=noninteractive
+          export HOME=/root
+          export LC_ALL=C
+
+          echo "rhema-os" > /etc/hostname
+          echo "127.0.0.1 localhost rhema-os" > /etc/hosts
+
+          cat << 'SOURCES' > /etc/apt/sources.list
+          deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+          SOURCES
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+              linux-image-amd64 live-boot live-boot-initramfs-tools systemd-sysv \
+              grub-pc-bin grub-efi-amd64-bin xorriso squashfs-tools mtools \
+              sudo network-manager nano pipewire plymouth sddm \
+              plasma-desktop dolphin konsole plank calamares calamares-settings-debian
+
+          # Criar usuário live
+          useradd -m -s /bin/bash rhema
+          echo "rhema:live" | chpasswd
+          usermod -aG sudo,video,audio rhema
+          echo "rhema ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/rhema
+
+          # Auto-login
+          mkdir -p /etc/sddm.conf.d
+          echo -e "[Autologin]\nUser=rhema\nSession=plasma" > /etc/sddm.conf.d/autologin.conf
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          INNER_EOF
+
+          sudo chmod +x "$ROOTFS/tmp/setup.sh"
+          sudo chroot "$ROOTFS" /tmp/setup.sh
+          sudo rm "$ROOTFS/tmp/setup.sh"
+
+          echo "=== Desmontando ==="
+          sudo umount -lf "$ROOTFS/dev/pts" || true
+          sudo umount -lf "$ROOTFS/dev" || true
+          sudo umount -lf "$ROOTFS/proc" || true
+          sudo umount -lf "$ROOTFS/sys" || true
+
+          echo "=== 4. Compactando em SquashFS ==="
+          sudo mksquashfs "$ROOTFS" "$ISO_DIR/live/filesystem.squashfs" -comp xz -e boot
+
+          sudo cp "$ROOTFS/boot/vmlinuz-"* "$ISO_DIR/live/vmlinuz"
+          sudo cp "$ROOTFS/boot/initrd.img-"* "$ISO_DIR/live/initrd"
+
+          echo "=== 5. Configurando o GRUB da ISO ==="
+          sudo mkdir -p "$ISO_DIR/boot/grub"
+          cat << 'GRUB_EOF' | sudo tee "$ISO_DIR/boot/grub/grub.cfg" > /dev/null
+          insmod part_gpt
+          insmod part_msdos
+          insmod fat
+          insmod ext2
+          set default="0"
+          set timeout=5
+          menuentry "RhemaOS 1.0 (Live)" {
+              linux /live/vmlinuz boot=live quiet splash ---
+              initrd /live/initrd
+          }
+          menuentry "Instalar RhemaOS" {
+              linux /live/vmlinuz boot=live quiet splash calamares ---
+              initrd /live/initrd
+          }
+          GRUB_EOF
+
+          echo "=== 6. Gerando ISO final ==="
+          sudo grub-mkrescue -o "$ISO_NAME" "$ISO_DIR"
+          EOF
+          chmod +x build.sh
+
+      - name: Executar o build
+        run: ./build.sh
+
+      - name: Upload da ISO do RhemaOS
+        uses: actions/upload-artifact@v4
+        with:
+          name: RhemaOS-Beta-ISO
+          path: RhemaOS-1.0-Beta-amd64.iso
+          retention-days: 5
